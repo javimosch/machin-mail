@@ -1,0 +1,242 @@
+// machin-mail — a self-contained SMTP toolkit in one MFL binary: SEND mail (an SMTP
+// client) and CATCH it (a local SMTP sink + a web inbox to view what was sent). The
+// catcher makes the sender testable with zero external dependencies — no real mail
+// server, no credentials, no network. It doubles as a dev "mail catcher" (MailHog /
+// Mailpit in one binary): point your app's SMTP at it and read the messages in a browser.
+//
+//   machin-mail sink   --smtp-port 1025 --web-port 8025 --db machin-mail.db
+//   machin-mail send   --host 127.0.0.1 --port 1025 --from a@x --to b@y --subject Hi --body "..."
+//   machin-mail help-json
+//
+// Agent-first: stdout is JSON, errors are structured JSON on stderr, semantic exit codes.
+
+var g_db = "machin-mail.db"
+
+type MailRow struct {
+    id        string
+    ts        int
+    mail_from string
+    rcpt_to   string
+    subject   string
+    body      string
+}
+
+// ---- args ----
+
+func arg_flag(name, def) (v) {
+    v = def
+    a := args()
+    i := 1
+    while i < len(a) {
+        if a[i] == name { if i + 1 < len(a) { v = a[i + 1] } }
+        i = i + 1
+    }
+}
+
+func jesc(s) (r) {
+    r = replace(s, "\\", "\\\\")
+    r = replace(r, "\"", "\\\"")
+    r = replace(r, "\n", "\\n")
+    r = replace(r, "\r", "")
+    r = replace(r, "\t", " ")
+}
+func hesc(s) (r) {
+    r = replace(s, "&", "&amp;")
+    r = replace(r, "<", "&lt;")
+    r = replace(r, ">", "&gt;")
+}
+func err_json(code, kind, msg) {
+    e := write(2, "{\"ok\":false,\"error\":{\"code\":" + str(code) + ",\"type\":\"" + kind + "\",\"message\":\"" + jesc(msg) + "\"}}\n")
+}
+
+// ---- store ----
+
+func db_open() (db) {
+    db = sqlite_open(g_db)
+    bt := sqlite_exec(db, "PRAGMA busy_timeout=5000")
+    wal := sqlite_exec(db, "PRAGMA journal_mode=WAL")
+}
+func db_init() {
+    db := db_open()
+    r := sqlite_exec(db, "CREATE TABLE IF NOT EXISTS mails (id TEXT PRIMARY KEY, ts INTEGER, mail_from TEXT, rcpt_to TEXT, subject TEXT, body TEXT)")
+    sqlite_close(db)
+}
+func store_mail(mail) {
+    db := db_open()
+    id := to_hex(rand_bytes(8))
+    subj := mail_header(mail.data, "Subject")
+    r := sqlite_exec(db, "INSERT INTO mails (id, ts, mail_from, rcpt_to, subject, body) VALUES (?, ?, ?, ?, ?, ?)",
+        []string{id, str(now()), mail.mail_from, mail.rcpt_to, subj, mail.data})
+    sqlite_close(db)
+}
+func list_mails() (rows) {
+    db := db_open()
+    j := sqlite_query(db, "SELECT id, ts, mail_from, rcpt_to, subject, body FROM mails ORDER BY ts DESC")
+    sqlite_close(db)
+    if j == "" { j = "[]" }
+    rows = parse(j, []MailRow{})
+}
+func get_mail(id) (row, ok) {
+    ok = 0
+    db := db_open()
+    j := sqlite_query(db, "SELECT id, ts, mail_from, rcpt_to, subject, body FROM mails WHERE id = ?", []string{id})
+    sqlite_close(db)
+    if j == "" { j = "[]" }
+    rs := parse(j, []MailRow{})
+    if len(rs) > 0 { row = rs[0]  ok = 1 }
+}
+func clear_all() {
+    db := db_open()
+    r := sqlite_exec(db, "DELETE FROM mails")
+    sqlite_close(db)
+}
+
+// ---- the SMTP catcher (server) ----
+
+func smtp_handle(conn) {
+    mail, ok := smtp_recv(conn)
+    close(conn)
+    if ok == 1 { store_mail(mail) }
+}
+func smtp_loop(port) {
+    srv := listen(port)
+    println("machin-mail SMTP catcher listening on :" + str(port))
+    while 1 == 1 {
+        conn := accept(srv)
+        go smtp_handle(conn)
+    }
+}
+
+// ---- the web inbox ----
+
+func fmt_time(unix) (s) {
+    f := time_fields(unix)
+    s = str(f[0]) + "-" + p2(f[1]) + "-" + p2(f[2]) + " " + p2(f[3]) + ":" + p2(f[4])
+}
+func p2(n) (s) { s = str(n)  if n < 10 { s = "0" + s } }
+
+func inbox_page() (h) {
+    rows := list_mails()
+    items := ""
+    if len(rows) == 0 {
+        items = "<p class=muted>No mail caught yet. Point your app's SMTP at this host and send something.</p>"
+    } else {
+        for _, m := range rows {
+            subj := m.subject
+            if subj == "" { subj = "(no subject)" }
+            items = items + "<a class=row href=\"/m/" + m.id + "\">" +
+                "<div class=subj>" + hesc(subj) + "</div>" +
+                "<div class=meta>" + hesc(m.mail_from) + " &rarr; " + hesc(m.rcpt_to) + "</div>" +
+                "<div class=time>" + fmt_time(m.ts) + "</div></a>"
+        }
+    }
+    h = "<!doctype html><meta charset=utf-8><title>machin-mail</title><style>" +
+        "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:1.5rem auto;padding:0 1rem;color:#1a1a1a}" +
+        "h1{font-size:1.2rem}.bar{display:flex;align-items:center;gap:.5rem;margin-bottom:1rem}.bar form{margin-left:auto}" +
+        "button{font:inherit;background:#eee;border:1px solid #ddd;border-radius:6px;padding:.35rem .7rem;cursor:pointer}" +
+        ".row{display:block;text-decoration:none;color:inherit;border:1px solid #eee;border-radius:8px;padding:.6rem .8rem;margin-bottom:.5rem}" +
+        ".row:hover{background:#fafafa}.subj{font-weight:600}.meta{color:#666;font-size:.85rem}.time{color:#aaa;font-size:.8rem}.muted{color:#999}" +
+        "</style><div class=bar><h1>📬 machin-mail</h1>" +
+        "<form method=post action=/clear><button>Clear all</button></form></div>" + items
+}
+
+func mail_page(id) (res) {
+    m, ok := get_mail(id)
+    if ok == 0 { res = not_found()  return }
+    subj := m.subject
+    if subj == "" { subj = "(no subject)" }
+    h := "<!doctype html><meta charset=utf-8><title>" + hesc(subj) + "</title><style>" +
+        "body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:1.5rem auto;padding:0 1rem;color:#1a1a1a}" +
+        "a{color:#1769ff;text-decoration:none}.h{border:1px solid #eee;border-radius:8px;padding:.8rem;margin:.5rem 0;background:#fafafa}" +
+        ".k{color:#888}pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #eee;border-radius:8px;padding:1rem}" +
+        "</style><p><a href=\"/\">&larr; inbox</a></p>" +
+        "<div class=h><div><span class=k>From:</span> " + hesc(m.mail_from) + "</div>" +
+        "<div><span class=k>To:</span> " + hesc(m.rcpt_to) + "</div>" +
+        "<div><span class=k>Subject:</span> " + hesc(subj) + "</div>" +
+        "<div><span class=k>Date:</span> " + fmt_time(m.ts) + "</div></div>" +
+        "<pre>" + hesc(mail_body(m.body)) + "</pre>"
+    res = ok_html(h)
+}
+
+func list_json() (j) {
+    rows := list_mails()
+    j = "["
+    i := 0
+    while i < len(rows) {
+        m := rows[i]
+        if i > 0 { j = j + "," }
+        j = j + "{\"id\":\"" + m.id + "\",\"ts\":" + str(m.ts) + ",\"from\":\"" + jesc(m.mail_from) +
+            "\",\"to\":\"" + jesc(m.rcpt_to) + "\",\"subject\":\"" + jesc(m.subject) + "\"}"
+        i = i + 1
+    }
+    j = j + "]"
+}
+
+func web(req) (res) {
+    p := req.path
+    qi := index(p, "?")
+    if qi >= 0 { p = substr(p, 0, qi) }
+    if p == "/_health" { res = ok_json("{\"ok\":true,\"service\":\"machin-mail\"}")  return }
+    if p == "/api/mails" { res = ok_json(list_json())  return }
+    if p == "/" { res = ok_html(inbox_page())  return }
+    if has_prefix(p, "/m/") { res = mail_page(substr(p, 3, len(p)))  return }
+    if req.method == "POST" { if p == "/clear" { clear_all()  res = redirect("/")  return } }
+    res = not_found()
+}
+
+// ---- subcommands ----
+
+func cmd_send() (code) {
+    host := arg_flag("--host", "127.0.0.1")
+    port := parse_int(arg_flag("--port", "1025"))
+    from := arg_flag("--from", "")
+    to := arg_flag("--to", "")
+    subject := arg_flag("--subject", "")
+    body := arg_flag("--body", "")
+    user := arg_flag("--user", "")
+    pass := arg_flag("--pass", "")
+    code = 0
+    if from == "" || to == "" {
+        err_json(80, "input", "--from and --to are required")
+        code = 80
+        return
+    }
+    ok, errmsg := smtp_send(host, port, from, to, subject, body, user, pass)
+    if ok == 0 {
+        err_json(100, "integration", errmsg)
+        code = 100
+        return
+    }
+    println("{\"ok\":true,\"to\":\"" + jesc(to) + "\",\"subject\":\"" + jesc(subject) + "\"}")
+}
+
+func cmd_sink() (code) {
+    smtp_port := parse_int(arg_flag("--smtp-port", "1025"))
+    web_port := parse_int(arg_flag("--web-port", "8025"))
+    g_db = arg_flag("--db", "machin-mail.db")
+    db_init()
+    println("{\"ok\":true,\"smtp_port\":" + str(smtp_port) + ",\"web_port\":" + str(web_port) + ",\"db\":\"" + jesc(g_db) + "\"}")
+    go smtp_loop(smtp_port)
+    serve(web_port, func(req) { return web(req) })   // the web inbox (blocks)
+    code = 0
+}
+
+func cmd_help() {
+    println("{\"name\":\"machin-mail\",\"commands\":{" +
+        "\"send\":\"--host --port --from --to --subject --body [--user --pass]\"," +
+        "\"sink\":\"--smtp-port(1025) --web-port(8025) --db(machin-mail.db)\"," +
+        "\"help-json\":\"this\",\"version\":\"print version\"}," +
+        "\"exit_codes\":{\"0\":\"ok\",\"80\":\"input\",\"100\":\"integration\"}}")
+}
+
+func main() {
+    a := args()
+    cmd := ""
+    if len(a) >= 2 { cmd = a[1] }
+    if cmd == "send" { exit(cmd_send())  return }
+    if cmd == "sink" { exit(cmd_sink())  return }
+    if cmd == "help-json" { cmd_help()  return }
+    if cmd == "version" { println("machin-mail 1.0") return }
+    err_json(80, "input", "usage: machin-mail <send|sink|help-json|version>")
+    exit(80)
+}

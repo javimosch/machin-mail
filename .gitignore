@@ -1,0 +1,5 @@
+/machin-mail
+/mail.mfl
+*.db
+*.db-wal
+*.db-shm
