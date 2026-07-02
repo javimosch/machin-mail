@@ -18,6 +18,11 @@ binary) — point your app's SMTP at it and read the messages in a browser.
     --from app@acme.test --to alice@acme.test --subject "Welcome" --body "Your account is ready."
 
 # 3) read it at http://localhost:8025
+
+# or send through a real relay that requires TLS (Gmail, SendGrid, SES on :587)
+./machin-mail send --host smtp.gmail.com --port 587 --starttls 1 \
+    --user you@gmail.com --pass "app-password" \
+    --from you@gmail.com --to alice@example.com --subject "Hi" --body "Sent over STARTTLS."
 ```
 
 ## Why this exists
@@ -29,14 +34,19 @@ primitive machin had no support for. Now it does, in pure MFL over `dial`/`liste
 read/write:
 
 - **`smtp_send(...)`** — the full `220` / `EHLO` / `AUTH LOGIN` / `MAIL` / `RCPT` / `DATA`
-  / `QUIT` conversation, with base64 AUTH, multiple recipients, and dot-stuffing.
+  / `QUIT` conversation, with base64 AUTH, multiple recipients, dot-stuffing, and (since
+  machin [v0.92.0](https://github.com/javimosch/machin/blob/main/CHANGELOG.md)) **STARTTLS**
+  (`--starttls 1`) — the `tls_client_fd` primitive upgrades the connection in place right
+  after `EHLO`, so a relay that *requires* TLS (Gmail/SendGrid/SES on `:587`) is reachable,
+  not just a plaintext-accepting one.
 - **`smtp_recv(conn)`** — the receiving side of one session, so you can build a catcher
-  (this app) or a real mailbox.
+  (this app) or a real mailbox. Plaintext only — the local `sink` is a dev tool, not a
+  public-facing relay, so it doesn't need STARTTLS.
 
 Kept self-contained on purpose: the `sink` lets you exercise the `send` path end-to-end
 with nothing else installed. (Verified both directions against Python's stdlib `smtplib` —
 machin client → Python server and Python client → machin sink — all without any external
-package.)
+package. STARTTLS verified against a genuinely live `smtp.gmail.com:587`.)
 
 ## Commands
 
@@ -91,10 +101,10 @@ smtplib.SMTP("127.0.0.1", 1025).send_message(m)   # appears in the web inbox ins
 
 ## v1 scope (honest edges)
 
-- **Plaintext SMTP + AUTH LOGIN/PLAIN.** No STARTTLS / implicit TLS yet — so for a public
-  relay (Gmail, SendGrid, SES) that *requires* TLS you'd need that added to machin first
-  (a wrap-an-fd-in-TLS primitive). It works today with a relay that accepts plaintext
-  submission, and with the local catcher.
+- **STARTTLS (`--starttls 1`) for the sender, not the catcher.** `send` can now reach a
+  relay that *requires* TLS (Gmail/SendGrid/SES on `:587`) via `tls_client_fd`. The `sink`
+  is still plaintext-only — it's a dev tool, not a public-facing relay. No implicit TLS
+  (SMTPS on `:465`) — STARTTLS (explicit upgrade on `:587`/`:25`) only.
 - **The catcher accepts everything** (any recipient, any AUTH) — it's a dev sink, not a
   real MTA. No spam handling, no delivery, no queueing.
 - **No attachments / MIME multipart** in the helpers (the body is `text/plain`); raw DATA

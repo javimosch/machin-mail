@@ -5,7 +5,7 @@
 // Mailpit in one binary): point your app's SMTP at it and read the messages in a browser.
 //
 //   machin-mail sink   --smtp-port 1025 --web-port 8025 --db machin-mail.db
-//   machin-mail send   --host 127.0.0.1 --port 1025 --from a@x --to b@y --subject Hi --body "..."
+//   machin-mail send   --host 127.0.0.1 --port 1025 --from a@x --to b@y --subject Hi --body "..." [--starttls 1]
 //   machin-mail help-json
 //
 // Agent-first: stdout is JSON, errors are structured JSON on stderr, semantic exit codes.
@@ -195,13 +195,14 @@ func cmd_send() (code) {
     body := arg_flag("--body", "")
     user := arg_flag("--user", "")
     pass := arg_flag("--pass", "")
+    use_tls := parse_int(arg_flag("--starttls", "0"))
     code = 0
     if from == "" || to == "" {
         err_json(80, "input", "--from and --to are required")
         code = 80
         return
     }
-    ok, errmsg := smtp_send(host, port, from, to, subject, body, user, pass)
+    ok, errmsg := smtp_send(host, port, from, to, subject, body, user, pass, use_tls)
     if ok == 0 {
         err_json(100, "integration", errmsg)
         code = 100
@@ -223,7 +224,7 @@ func cmd_sink() (code) {
 
 func cmd_help() {
     println("{\"name\":\"machin-mail\",\"commands\":{" +
-        "\"send\":\"--host --port --from --to --subject --body [--user --pass]\"," +
+        "\"send\":\"--host --port --from --to --subject --body [--user --pass] [--starttls 1]\"," +
         "\"sink\":\"--smtp-port(1025) --web-port(8025) --db(machin-mail.db)\"," +
         "\"help-json\":\"this\",\"version\":\"print version\"}," +
         "\"exit_codes\":{\"0\":\"ok\",\"80\":\"input\",\"100\":\"integration\"}}")
